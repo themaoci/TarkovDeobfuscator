@@ -3,17 +3,21 @@ using Mono.Cecil.Cil;
 using Newtonsoft.Json;
 using System.Diagnostics;
 using System.Reflection;
+using de4dot.cui;
 
 namespace TarkovDeobfuscator
 {
     public class Deobf
     {
+        public static bool DEBUG = false;
+        #region Logger - move somewhere else !!!
         public delegate void LogHandler(string text);
         public static event LogHandler OnLog;
         public static List<string> Logged = new List<string>();
 
-        internal static void Log(string text)
+        internal static void Log(string text, bool unimportant = false)
         {
+            if (!DEBUG && unimportant) return;
             if (OnLog != null)
             {
                 OnLog(text);
@@ -25,12 +29,67 @@ namespace TarkovDeobfuscator
                 Logged.Add(text);
             }
         }
+        #endregion
+
+
+
         public static bool DeobfuscateAssembly(string assemblyPath, string managedPath, bool createBackup = true, bool overwriteExisting = false, bool doRemapping = false)
         {
             var de4dotLocation = Path.Combine(Directory.GetCurrentDirectory(), "Deobfuscator", "de4dot.exe");
 
-            string token;
+            // get --strtok Token for string deobfuscation
+            GetStringDeobfuscationToken(assemblyPath);
+            Application.Stopwatch.Stop();
+            // run de4dot internally for assembly deobfuscation
+            De4DotExecutor.RunDe4dot(new string[] {
+                $"--un-name",
+                $"!^<>[a-z0-9]$&!^<>[a-z0-9]__.*$&![A-Z][A-Z]\\$<>.*$&^[a-zA-Z_<{{$][a-zA-Z_0-9<>{{}}$.`-]*$",
+                $"{assemblyPath}",
+                $"--strtyp",
+                $"delegate",
+                $"--strtok",
+                $"{m_StringDeobfuscationToken}"
+            });
+            Application.Stopwatch.Start();
 
+            // Fixes "ResolutionScope is null" by rewriting the assembly
+#pragma warning disable CS8604 // Possible null reference argument.
+            var AssemblyDllPath_Cleaned = Path.Combine(Path.GetDirectoryName(assemblyPath), Path.GetFileNameWithoutExtension(assemblyPath) + "-cleaned.dll");
+#pragma warning restore CS8604 // Possible null reference argument.
+            if (!File.Exists(AssemblyDllPath_Cleaned))
+            {
+                Log($"File does not exist in: {AssemblyDllPath_Cleaned}");
+                return false;
+            }
+
+            // add resolved paths to resolver and pass it into AssemblyResolver
+            var resolver = new DefaultAssemblyResolver();
+            resolver.AddSearchDirectory(managedPath);
+
+            using (var memoryStream = new MemoryStream(File.ReadAllBytes(AssemblyDllPath_Cleaned)))
+            using (var assemblyDefinition = AssemblyDefinition.ReadAssembly(memoryStream, new ReaderParameters(){ AssemblyResolver = resolver }))
+            {
+                assemblyDefinition.Write(AssemblyDllPath_Cleaned);
+            }
+
+            Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (Starting)");
+            if (doRemapping)
+                RemapKnownClasses(managedPath, AssemblyDllPath_Cleaned);
+            Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (RemapKnownClasses)");
+            if (createBackup)
+                BackupExistingAssembly(assemblyPath);
+            Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (BackupExistingAssembly)");
+            if (overwriteExisting)
+                OverwriteExistingAssembly(assemblyPath, AssemblyDllPath_Cleaned);
+            Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (OverwriteExistingAssembly)");
+
+            Log($"DeObfuscation complete!");
+
+            return true;
+        }
+        #region Deobfuscation functions (move somewhere else...)
+        private static void GetStringDeobfuscationToken(string assemblyPath)
+        {
             using (var assemblyDefinition = AssemblyDefinition.ReadAssembly(assemblyPath))
             {
                 var potentialStringDelegates = new List<MethodDefinition>();
@@ -56,46 +115,20 @@ namespace TarkovDeobfuscator
                         }
 
                         potentialStringDelegates.Add(method);
+                        Log($"String Delegate Candidate: {type.Namespace}.{type.Name}.{method.Name}");
                     }
                 }
 
                 var deobfRid = potentialStringDelegates[0].MetadataToken;
 
-                token = $"0x{((uint)deobfRid.TokenType | deobfRid.RID):x4}";
+                m_StringDeobfuscationToken = $"0x{((uint)deobfRid.TokenType | deobfRid.RID):x4}";
 
-                Console.WriteLine($"Deobfuscation token: {token}");
+                Log($"Deobfuscation token: {m_StringDeobfuscationToken}");
             }
-
-            var process = Process.Start(de4dotLocation,
-                $"--un-name \"!^<>[a-z0-9]$&!^<>[a-z0-9]__.*$&![A-Z][A-Z]\\$<>.*$&^[a-zA-Z_<{{$][a-zA-Z_0-9<>{{}}$.`-]*$\" \"{assemblyPath}\" --strtyp delegate --strtok \"{token}\"");
-
-            process.WaitForExit();
-
-
-            // Fixes "ResolutionScope is null" by rewriting the assembly
-            var cleanedDllPath = Path.Combine(Path.GetDirectoryName(assemblyPath), Path.GetFileNameWithoutExtension(assemblyPath) + "-cleaned.dll");
-
-            var resolver = new DefaultAssemblyResolver();
-            resolver.AddSearchDirectory(managedPath);
-
-            using (var memoryStream = new MemoryStream(File.ReadAllBytes(cleanedDllPath)))
-            using (var assemblyDefinition = AssemblyDefinition.ReadAssembly(memoryStream, new ReaderParameters(){ AssemblyResolver = resolver }))
-            {
-                assemblyDefinition.Write(cleanedDllPath);
-            }
-
-
-            if (doRemapping)
-                RemapKnownClasses(managedPath, cleanedDllPath);
-            if (createBackup)
-                BackupExistingAssembly(assemblyPath);
-            if (overwriteExisting)
-                OverwriteExistingAssembly(assemblyPath, cleanedDllPath);
-
-            Log($"DeObfuscation complete!");
-
-            return true;
         }
+
+        #endregion
+        private static string m_StringDeobfuscationToken = "";
 
         private static void OverwriteExistingAssembly(string assemblyPath, string cleanedDllPath, bool deleteCleaned = false)
         {
@@ -105,6 +138,7 @@ namespace TarkovDeobfuscator
             if (deleteCleaned)
                 File.Delete(cleanedDllPath);
         }
+        
         private static void RemapKnownClasses(string managedPath, string assemblyPath)
         {
             var resolver = new DefaultAssemblyResolver();
@@ -119,133 +153,134 @@ namespace TarkovDeobfuscator
                 {
                     if (oldAssembly != null)
                     {
-                        RemapperConfig autoRemapperConfig = JsonConvert.DeserializeObject<RemapperConfig>(File.ReadAllText(Directory.GetCurrentDirectory() + "//Deobfuscator/AutoRemapperConfig.json"));
+                        var autoRemapperConfig = JsonConvert.DeserializeObject<RemapperConfig>(File.ReadAllText($"{Directory.GetCurrentDirectory()}//Deobfuscator/AutoRemapperConfig.json"));
+                        if(autoRemapperConfig == null)
+                        {
+                            Log($"Unable to find: $\"{{Directory.GetCurrentDirectory()}}//Deobfuscator/AutoRemapperConfig.json\" \n Exiting RemapKnownClasses");
+                            return;
+                        }
+                        Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (start-RemapKnownClasses)");
                         RemapByAutoConfiguration(oldAssembly, autoRemapperConfig);
+                        Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (RemapByAutoConfiguration)");
                         RemapByDefinedConfiguration(oldAssembly, autoRemapperConfig);
+                        Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (RemapByDefinedConfiguration)");
                         RemapAfterEverything(oldAssembly, autoRemapperConfig);
+                        Log($"Elapsed: {Application.Stopwatch.ElapsedMilliseconds}ms (RemapAfterEverything)");
                         oldAssembly.Write(assemblyPath.Replace(".dll", "-remapped.dll"));
                     }
                 }
             }
             File.Copy(assemblyPath.Replace(".dll", "-remapped.dll"), assemblyPath, true);
-
         }
+        static Dictionary<string, int> gclassToNameCounts = new Dictionary<string, int>();
+
+        static bool ParameterNameStartsWith(ParameterDefinition p)
+        {
+            return p.ParameterType.Name.StartsWith("GClass") || p.ParameterType.Name.StartsWith("GStruct") || p.ParameterType.Name.StartsWith("GInterface");
+        }
+        static bool FieldNameStartsWith(FieldDefinition p)
+        {
+            return p.FieldType.Name.StartsWith("GClass") || p.FieldType.Name.StartsWith("GStruct") || p.FieldType.Name.StartsWith("GInterface");
+        }
+        // Replace anti C# naming scheme made by compilers and obfuscators
+        static string ReplaceAntiCSNames(string Name)
+        {
+            return Name.Replace("[]", "").Replace("`1", "").Replace("&", "").Replace(" ", "");
+        }
+        static bool ShouldSkipThisOne(string Name)
+        {
+            return Name.StartsWith("GClass", StringComparison.OrdinalIgnoreCase)
+            || Name.StartsWith("GStruct", StringComparison.OrdinalIgnoreCase)
+            || Name.StartsWith("GInterface", StringComparison.OrdinalIgnoreCase)
+            || Name.StartsWith("_")
+            || Name.Contains("_")
+            || Name.Contains("/");
+        }
+
+
         static void RemapByAutoConfiguration(AssemblyDefinition oldAssembly, RemapperConfig autoRemapperConfig)
         {
             if (!autoRemapperConfig.EnableAutomaticRemapping)
                 return;
-
-            var gclasses = oldAssembly.MainModule.GetTypes().Where(x =>
-                x.Name.StartsWith("GClass"));
-            var gclassToNameCounts = new Dictionary<string, int>();
+            //var gclasses = oldAssembly.MainModule.GetTypes().Where(x =>
+            //    x.Name.StartsWith("GClass"));
+            var systemAssemblyTypes = Assembly.GetAssembly(typeof(Attribute))?.GetTypes();
+            var oldAssemblyTypes = oldAssembly.MainModule.GetTypes();
+            if (systemAssemblyTypes == null) systemAssemblyTypes = new Type[] { };
+            // Detecting if ParameterType starts with GClass/GStruct/GInterface
 
             //foreach (var t in oldAssembly.MainModule.GetTypes().Where(x => !x.Name.StartsWith("GClass") && !x.Name.StartsWith("Class")))
-            foreach (var t in oldAssembly.MainModule.GetTypes())
+
+           // Log($"t0: {Application.Stopwatch.ElapsedMilliseconds}ms");
+            //this sometimes crashes just run it again...
+            var sync = new object();
+            Parallel.ForEach(oldAssemblyTypes, t =>
             {
-                // --------------------------------------------------------
-                // Renaming by the classes being in methods
-                foreach (var m in t.Methods.Where(x => x.HasParameters
-                    && x.Parameters.Any(p =>
-                    p.ParameterType.Name.StartsWith("GClass")
-                    || p.ParameterType.Name.StartsWith("GStruct")
-                    || p.ParameterType.Name.StartsWith("GInterface")
-                    //|| p.ParameterType.Name.StartsWith("Class")
-
-                    )))
+                Dictionary<string, int> tempList = new Dictionary<string, int>();
+                // Creating Renaming List by the classes being in methods
+                t.Methods.Where(x => x.HasParameters && x.Parameters.Any(ParameterNameStartsWith)).ToList()
+                .ForEach(m =>
                 {
-                    // --------------------------------------------------------
-                    // Renaming by the classes being used as Parameters in methods
-                    foreach (var p in m.Parameters
-                        .Where(x =>
-                        x.ParameterType.Name.StartsWith("GClass")
-                        || x.ParameterType.Name.StartsWith("GStruct")
-                        || x.ParameterType.Name.StartsWith("GInterface")
-                        //|| x.ParameterType.Name.StartsWith("Class")
-                        ))
+                    // Creating Renaming List by the classes being used as Parameters in methods
+                    m.Parameters.Where(ParameterNameStartsWith).ToList()
+                    .ForEach(p =>
                     {
-                        var n = p.ParameterType.Name
-                            .Replace("[]", "")
-                            .Replace("`1", "")
-                            .Replace("&", "")
-                            .Replace(" ", "")
-                            + "." + p.Name;
-                        if (!gclassToNameCounts.ContainsKey(n))
-                            gclassToNameCounts.Add(n, 0);
+                        var n = $"{ReplaceAntiCSNames(p.ParameterType.Name)}.{p.Name}";
 
-                        gclassToNameCounts[n]++;
+                        if (!tempList.ContainsKey(n))
+                        {
+                            tempList.Add(n, 1);
+                        }
+                        else 
+                        {
+                            tempList[n]++;
+                        }
+
+                    });
+                });
+
+                // Creating Renaming List by the fields in class
+                t.Fields.Where(FieldNameStartsWith).ToList()
+                .ForEach(prop =>
+                {
+                    if (!ShouldSkipThisOne(prop.Name))
+                    {
+                        var n = $"{ReplaceAntiCSNames(prop.FieldType.Name)}.{prop.Name}";
+
+                        if (!tempList.ContainsKey(n))
+                        {
+                                tempList.Add(n, 1);
+                        }
+                        else
+                        {
+                                tempList[n]++;
+                        }
                     }
-
-                }
-
-                // --------------------------------------------------------
-                // Renaming by the classes being used as Members/Properties/Fields in other classes
-                foreach (var prop in t.Properties.Where(p =>
-                    p.PropertyType.Name.StartsWith("GClass")
-                    || p.PropertyType.Name.StartsWith("GStruct")
-                    || p.PropertyType.Name.StartsWith("GInterface")
-                    ))
+                });
+                lock (sync)
                 {
-                    // if the property name includes "gclass" or whatever, then ignore it as its useless to us
-                    if (prop.Name.StartsWith("GClass", StringComparison.OrdinalIgnoreCase)
-                        || prop.Name.StartsWith("GStruct", StringComparison.OrdinalIgnoreCase)
-                        || prop.Name.StartsWith("GInterface", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    var n = prop.PropertyType.Name
-                        .Replace("[]", "")
-                        .Replace("`1", "")
-                        .Replace("&", "")
-                        .Replace(" ", "")
-                        + "." + prop.Name;
-                    if (!gclassToNameCounts.ContainsKey(n))
-                        gclassToNameCounts.Add(n, 0);
-
-                    gclassToNameCounts[n]++;
-                    // this is shit and needs fixing
-                    //if (gclassToNameCounts[n] > 1)
+                    //foreach (var item in tempList) 
                     //{
-                    //    gclassToNameCounts[n] = 0;
+                    //    if (gclassToNameCounts.Keys.Contains(item.Key))
+                    //    {
+                    //        gclassToNameCounts[item.Key] += item.Value;
+                    //        continue;
+                    //    }
+                    //    gclassToNameCounts.Add(item.Key, item.Value);
                     //}
+                    gclassToNameCounts = gclassToNameCounts.Concat(tempList.Where(x => {
+                        if (gclassToNameCounts.Keys.Contains(x.Key)) 
+                        {
+                            gclassToNameCounts[x.Key] += x.Value;
+                            return false;
+                        }
+                        return true; 
+                    })).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
                 }
+            });
 
-                foreach (var prop in t.Fields.Where(p =>
-                    p.FieldType.Name.StartsWith("GClass")
-                    || p.FieldType.Name.StartsWith("GStruct")
-                    || p.FieldType.Name.StartsWith("GInterface")
-                    ))
-                {
-                    if (prop.Name.StartsWith("GClass", StringComparison.OrdinalIgnoreCase)
-                    || prop.Name.StartsWith("GStruct", StringComparison.OrdinalIgnoreCase)
-                    || prop.Name.StartsWith("GInterface", StringComparison.OrdinalIgnoreCase)
-                    || prop.Name.StartsWith("_")
-                    || prop.Name.Contains("_")
-                    || prop.Name.Contains("/")
-                    )
-                        continue;
-
-                    //if(prop.Name == "AirplaneDataPacket")
-                    //{
-
-                    //}
-
-                    var n = prop.FieldType.Name
-                        .Replace("[]", "")
-                        .Replace("`1", "")
-                        .Replace("&", "")
-                        .Replace(" ", "")
-                        + "." + prop.Name;
-                    if (!gclassToNameCounts.ContainsKey(n))
-                        gclassToNameCounts.Add(n, 0);
-
-                    gclassToNameCounts[n]++;
-                    //if (gclassToNameCounts[n] > 1)
-                    //{
-                    //    gclassToNameCounts[n] = 0;
-                    //}
-                }
-
-
-            }
+            Log($"Classified to rename: {gclassToNameCounts.Count}");
+           // Log($"t1: {Application.Stopwatch.ElapsedMilliseconds}ms");
 
             var autoRemappedClassCount = 0;
 
@@ -254,6 +289,9 @@ namespace TarkovDeobfuscator
             var orderedGClassCounts = gclassToNameCounts.Where(x => x.Value > 0 && !x.Key.Contains("`")).OrderByDescending(x => x.Value);
             var usedNamesCount = new Dictionary<string, int>();
             var renamedClasses = new Dictionary<string, string>();
+           // Log($"t2: {Application.Stopwatch.ElapsedMilliseconds}ms");
+
+            //Parallel.ForEach(orderedGClassCounts, g =>
             foreach (var g in orderedGClassCounts)
             {
                 var keySplit = g.Key.Split('.');
@@ -265,14 +303,14 @@ namespace TarkovDeobfuscator
                     || gclassNameNew.StartsWith("Instance", StringComparison.OrdinalIgnoreCase)
                     || gclassNameNew.StartsWith("_", StringComparison.OrdinalIgnoreCase)
                     || gclassNameNew.StartsWith("<", StringComparison.OrdinalIgnoreCase)
-                    || Assembly.GetAssembly(typeof(Attribute)).GetTypes().Any(x => x.Name.StartsWith(gclassNameNew, StringComparison.OrdinalIgnoreCase))
-                    || oldAssembly.MainModule.GetTypes().Any(x => x.Name.Equals(gclassNameNew, StringComparison.OrdinalIgnoreCase))
+                    || systemAssemblyTypes.Any(x => x.Name.StartsWith(gclassNameNew, StringComparison.OrdinalIgnoreCase))
+                    || oldAssemblyTypes.Any(x => x.Name.Equals(gclassNameNew, StringComparison.OrdinalIgnoreCase))
                     )
-                    continue;
+                    return;
 
-                var t = oldAssembly.MainModule.GetTypes().FirstOrDefault(x => x.Name == gclassName);
+                var t = oldAssemblyTypes.FirstOrDefault(x => x.Name == gclassName);
                 if (t == null)
-                    continue;
+                    return;
 
                 // Follow standard naming convention, PascalCase all class names
                 var newClassName = char.ToUpper(gclassNameNew[0]) + gclassNameNew.Substring(1);
@@ -292,55 +330,71 @@ namespace TarkovDeobfuscator
                 if (usedNamesCount[newClassName] > 1)
                     newClassName += usedNamesCount[newClassName];
 
-                if (!oldAssembly.MainModule.GetTypes().Any(x => x.Name == newClassName)
-                    && !Assembly.GetAssembly(typeof(Attribute)).GetTypes().Any(x => x.Name.StartsWith(newClassName, StringComparison.OrdinalIgnoreCase))
-                    && !oldAssembly.MainModule.GetTypes().Any(x => x.Name.Equals(newClassName, StringComparison.OrdinalIgnoreCase))
+                if (!oldAssemblyTypes.Any(x => x.Name == newClassName)
+                    && !systemAssemblyTypes.Any(x => x.Name.StartsWith(newClassName, StringComparison.OrdinalIgnoreCase))
+                    && !oldAssemblyTypes.Any(x => x.Name.Equals(newClassName, StringComparison.OrdinalIgnoreCase))
                     )
                 {
                     var oldClassName = t.Name;
                     t.Name = newClassName;
                     renamedClasses.Add(oldClassName, newClassName);
-                    Log($"Remapper: Auto Remapped {oldClassName} to {newClassName}");
+                    Log($"Remapper: [Auto] {oldClassName} => {newClassName}", true);
                 }
             }
+          //  Log($"t3: {Application.Stopwatch.ElapsedMilliseconds}ms");
+
             // end of renaming based on discovery
             // ---------------------------------------------------------------------------------------
 
             // ------------------------------------------------
             // Auto rename FirearmController sub classes
-            foreach (var t in oldAssembly.MainModule.GetTypes().Where(x
-                =>
-                    x.FullName.StartsWith("EFT.Player.FirearmController")
-                    && x.Name.StartsWith("GClass")
-
-                ))
+            foreach (var t in oldAssemblyTypes.Where(x => x.FullName.StartsWith("EFT.Player.FirearmController") && x.Name.StartsWith("GClass")))
             {
                 t.Name.Replace("GClass", "FirearmController");
             }
+           // Log($"t4: {Application.Stopwatch.ElapsedMilliseconds}ms");
 
             // ------------------------------------------------
             // Auto rename descriptors
-            foreach (var t in oldAssembly.MainModule.GetTypes())
+            Parallel.ForEach(oldAssemblyTypes, t =>
             {
                 foreach (var m in t.Methods.Where(x => x.Name.StartsWith("ReadEFT")))
                 {
                     if (m.ReturnType.Name.StartsWith("GClass"))
                     {
-                        var rT = oldAssembly.MainModule.GetTypes().FirstOrDefault(x => x == m.ReturnType);
+                        var rT = oldAssemblyTypes.FirstOrDefault(x => x == m.ReturnType);
                         if (rT != null)
                         {
                             var oldTypeName = rT.Name;
                             rT.Name = m.Name.Replace("ReadEFT", "");
-                            Log($"Remapper: Auto Remapped {oldTypeName} to {rT.Name}");
+                            Log($"Remapper: [Auto] {oldTypeName} => {rT.Name}", true);
 
                         }
                     }
                 }
-            }
+            });
+           // Log($"t5: {Application.Stopwatch.ElapsedMilliseconds}ms");
+            //    foreach (var t in oldAssemblyTypes)
+            //{
+            //    foreach (var m in t.Methods.Where(x => x.Name.StartsWith("ReadEFT")))
+            //    {
+            //        if (m.ReturnType.Name.StartsWith("GClass"))
+            //        {
+            //            var rT = oldAssemblyTypes.FirstOrDefault(x => x == m.ReturnType);
+            //            if (rT != null)
+            //            {
+            //                var oldTypeName = rT.Name;
+            //                rT.Name = m.Name.Replace("ReadEFT", "");
+            //                Log($"Remapper: [Auto] {oldTypeName} => {rT.Name}", true);
+
+            //            }
+            //        }
+            //    }
+            //}
 
             // Testing stuff here.
             // Quick hack to name properties properly in EFT.Player
-            foreach (var playerProp in oldAssembly.MainModule.GetTypes().FirstOrDefault(x => x.FullName == "EFT.Player").Properties)
+            foreach (var playerProp in oldAssemblyTypes.FirstOrDefault(x => x.FullName == "EFT.Player").Properties)
             {
                 if (playerProp.Name.StartsWith("GClass", StringComparison.OrdinalIgnoreCase))
                 {
@@ -348,25 +402,31 @@ namespace TarkovDeobfuscator
                 }
             }
 
+          //  Log($"t6: {Application.Stopwatch.ElapsedMilliseconds}ms");
             Log($"Remapper: Ensuring EFT classes are public");
-            foreach (var t in oldAssembly.MainModule.GetTypes())
+            foreach (var t in oldAssemblyTypes)
             {
                 if (t.IsClass && t.IsDefinition && t.BaseType != null && t.BaseType.FullName != "System.Object")
                 {
-                    if (!Assembly.GetAssembly(typeof(Attribute))
-                        .GetTypes()
-                        .Any(x => x.Name.StartsWith(t.Name, StringComparison.OrdinalIgnoreCase)))
+                    if (!systemAssemblyTypes.Any(x => x.Name.StartsWith(t.Name, StringComparison.OrdinalIgnoreCase)))
                         t.IsPublic = true;
                 }
             }
+          //  Log($"t7: {Application.Stopwatch.ElapsedMilliseconds}ms");
+            //    foreach (var t in oldAssemblyTypes)
+            //{
+            //    if (t.IsClass && t.IsDefinition && t.BaseType != null && t.BaseType.FullName != "System.Object")
+            //    {
+            //        if (!systemAssemblyTypes
+            //            .Any(x => x.Name.StartsWith(t.Name, StringComparison.OrdinalIgnoreCase)))
+            //            t.IsPublic = true;
+            //    }
+            //}
 
             Log($"Remapper: Setting EFT methods to public");
             foreach (var ctf in autoRemapperConfig.TypesToForceAllPublicMethods)
             {
-                var foundTypes = oldAssembly.MainModule.GetTypes()
-                    .Where(x => x.Namespace.Contains("EFT", StringComparison.OrdinalIgnoreCase))
-                    .Where(x => x.Name.Contains(ctf, StringComparison.OrdinalIgnoreCase));
-                foreach (var t in foundTypes)
+                foreach (var t in oldAssemblyTypes.Where(x => x.Namespace.Contains("EFT", StringComparison.OrdinalIgnoreCase) && x.Name.Contains(ctf, StringComparison.OrdinalIgnoreCase)))
                 {
                     foreach (var m in t.Methods)
                     {
@@ -375,14 +435,13 @@ namespace TarkovDeobfuscator
                     }
                 }
             }
+          //  Log($"t8: {Application.Stopwatch.ElapsedMilliseconds}ms");
 
             Log($"Remapper: Setting EFT fields/properties to public");
-            foreach (var ctf in autoRemapperConfig.TypesToForceAllPublicFieldsAndProperties)
-            {
-                var foundTypes = oldAssembly.MainModule.GetTypes()
-                    .Where(x => x.Namespace.Contains("EFT", StringComparison.OrdinalIgnoreCase))
-                    .Where(x => x.Name.Contains(ctf, StringComparison.OrdinalIgnoreCase));
-                foreach (var t in foundTypes)
+            Parallel.ForEach(autoRemapperConfig.TypesToForceAllPublicFieldsAndProperties, ctf => {
+            //foreach (var ctf in autoRemapperConfig.TypesToForceAllPublicFieldsAndProperties)
+            //{
+                foreach (var t in oldAssemblyTypes.Where(x => x.Namespace.Contains("EFT", StringComparison.OrdinalIgnoreCase) && x.Name.Contains(ctf, StringComparison.OrdinalIgnoreCase)))
                 {
                     foreach (var m in t.Fields)
                     {
@@ -390,16 +449,15 @@ namespace TarkovDeobfuscator
                             m.IsPublic = true;
                     }
                 }
-            }
+            });
+           // Log($"t9: {Application.Stopwatch.ElapsedMilliseconds}ms");
 
             Log($"Remapper: Setting All Types to public");
             if (autoRemapperConfig.ForceAllToPublic)
             {
-                var foundTypes = oldAssembly.MainModule.GetTypes();
-
-                foreach (var t in foundTypes)
-                {
+               Parallel.ForEach(oldAssemblyTypes, t => {
                     t.IsPublic = true;
+
                     foreach (var m in t.Fields)
                     {
                         if (!m.IsPublic)
@@ -425,13 +483,44 @@ namespace TarkovDeobfuscator
                         if (!m.DeclaringType.IsPublic)
                             m.DeclaringType.IsPublic = true;
                     }
-                }
+                });
+               // Log($"t10: {Application.Stopwatch.ElapsedMilliseconds}ms");
+                //foreach (var t in oldAssemblyTypes)
+                //{
+                //    t.IsPublic = true;
+
+                //    foreach (var m in t.Fields)
+                //    {
+                //        if (!m.IsPublic)
+                //            m.IsPublic = true;
+                //    }
+                //    foreach (var m in t.Methods)
+                //    {
+                //        if (!m.IsPublic)
+                //            m.IsPublic = true;
+                //    }
+                //    foreach (var m in t.NestedTypes)
+                //    {
+                //        if (!m.IsPublic)
+                //            m.IsPublic = true;
+                //    }
+                //    foreach (var m in t.Events)
+                //    {
+                //        if (!m.DeclaringType.IsPublic)
+                //            m.DeclaringType.IsPublic = true;
+                //    }
+                //    foreach (var m in t.Properties)
+                //    {
+                //        if (!m.DeclaringType.IsPublic)
+                //            m.DeclaringType.IsPublic = true;
+                //    }
+                //}
 
             }
 
 
             autoRemappedClassCount = renamedClasses.Count;
-            Log($"Remapper: Auto Remapped {autoRemappedClassCount} classes");
+            Log($"Remapper: Auto remapped {autoRemappedClassCount} classes");
         }
 
         private static void RemapByDefinedConfiguration(AssemblyDefinition oldAssembly, RemapperConfig autoRemapperConfig)
@@ -719,7 +808,7 @@ namespace TarkovDeobfuscator
                                 if (!t.IsInterface)
                                     numberOfChangedIndexes++;
 
-                                Log($"Remapper: Remapped {oldClassName} to {newClassName}");
+                                Log($"Remapper: {oldClassName} => {newClassName}", true);
                                 countOfDefinedMappingSucceeded++;
 
                             }
@@ -734,7 +823,7 @@ namespace TarkovDeobfuscator
 
                             t.Name = newClassName;
 
-                            Log($"Remapper: Remapped {oldClassName} to {newClassName}");
+                            Log($"Remapper: {oldClassName} => {newClassName}", true);
                             countOfDefinedMappingSucceeded++;
                         }
                     }
@@ -764,7 +853,7 @@ namespace TarkovDeobfuscator
                     .Where(x => x.Name.Contains(ctf, StringComparison.OrdinalIgnoreCase));
                 foreach (var t in foundTypes)
                 {
-                    Log(t.FullName + " is now Public");
+                    Log(t.FullName + " is now Public", true);
                     if (!t.IsPublic)
                         t.IsPublic = true;
                 }

@@ -5,39 +5,20 @@
     <TargetFramework>net6.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>preview</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Remove="Deobfuscator\AssemblyData.dll" />
     <None Remove="Deobfuscator\AutoRemapperConfig.json" />
-    <None Remove="Deobfuscator\de4dot.blocks.dll" />
-    <None Remove="Deobfuscator\de4dot.code.dll" />
-    <None Remove="Deobfuscator\de4dot.cui.dll" />
     <None Remove="Deobfuscator\de4dot.exe" />
-    <None Remove="Deobfuscator\de4dot.mdecrypt.dll" />
     <None Remove="Deobfuscator\dnlib.dll" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="Deobfuscator\AssemblyData.dll">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
     <Content Include="Deobfuscator\AutoRemapperConfig.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
-    <Content Include="Deobfuscator\de4dot.blocks.dll">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
-    <Content Include="Deobfuscator\de4dot.code.dll">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
-    <Content Include="Deobfuscator\de4dot.cui.dll">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
     <Content Include="Deobfuscator\de4dot.exe">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
-    <Content Include="Deobfuscator\de4dot.mdecrypt.dll">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
     <Content Include="Deobfuscator\dnlib.dll">
@@ -48,6 +29,14 @@
   <ItemGroup>
     <PackageReference Include="Mono.Cecil" Version="0.11.4" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\de4dot\AssemblyData\AssemblyData.csproj" />
+    <ProjectReference Include="..\de4dot\de4dot.blocks\de4dot.blocks.csproj" />
+    <ProjectReference Include="..\de4dot\de4dot.code\de4dot.code.csproj" />
+    <ProjectReference Include="..\de4dot\de4dot.cui\de4dot.cui.csproj" />
+    <ProjectReference Include="..\de4dot\de4dot.mdecrypt\de4dot.mdecrypt.csproj" />
   </ItemGroup>
 
 </Project>
